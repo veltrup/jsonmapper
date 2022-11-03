@@ -127,10 +127,19 @@ class JsonMapper
     protected $arInspectedClasses = array();
 
     /**
+     * Method to call on each object after deserialization is done.
+     *
+     * Is only called if it exists on the object.
+     *
+     * @var string|null
+     */
+    public $postMappingMethod = null;
+
+    /**
      * Map data all data in $json into the given $object instance.
      *
-     * @param object $json   JSON object structure from json_decode()
-     * @param object $object Object to map $json data into
+     * @param object|array $json   JSON object structure from json_decode()
+     * @param object       $object Object to map $json data into
      *
      * @return mixed Mapped object is returned.
      * @see    mapArray()
@@ -165,7 +174,7 @@ class JsonMapper
                     = $this->inspectProperty($rc, $key);
             }
 
-            list($hasProperty, $accessor, $type)
+            list($hasProperty, $accessor, $type, $isNullable)
                 = $this->arInspectedClasses[$strClassName][$key];
 
             if (!$hasProperty) {
@@ -204,7 +213,7 @@ class JsonMapper
                 continue;
             }
 
-            if ($this->isNullable($type) || !$this->bStrictNullTypes) {
+            if ($isNullable || !$this->bStrictNullTypes) {
                 if ($jvalue === null) {
                     $this->setProperty($object, $accessor, null);
                     continue;
@@ -303,6 +312,16 @@ class JsonMapper
             $this->removeUndefinedAttributes($object, $providedProperties);
         }
 
+        if ($this->postMappingMethod !== null
+            && $rc->hasMethod($this->postMappingMethod)
+        ) {
+            $refDeserializePostMethod = $rc->getMethod(
+                $this->postMappingMethod
+            );
+            $refDeserializePostMethod->setAccessible(true);
+            $refDeserializePostMethod->invoke($object);
+        }
+
         return $object;
     }
 
@@ -316,13 +335,11 @@ class JsonMapper
      */
     protected function getFullNamespace($type, $strNs)
     {
-        if ($type === null || $type === '' || $type[0] == '\\'
-            || $strNs == ''
-        ) {
+        if ($type === null || $type === '' || $type[0] === '\\' || $strNs === '') {
             return $type;
         }
         list($first) = explode('[', $type, 2);
-        if ($this->isSimpleType($first) || $first === 'mixed') {
+        if ($first === 'mixed' || $this->isSimpleType($first)) {
             return $type;
         }
 
@@ -345,7 +362,7 @@ class JsonMapper
         foreach ($rc->getProperties() as $property) {
             $rprop = $rc->getProperty($property->name);
             $docblock = $rprop->getDocComment();
-            $annotations = $this->parseAnnotations($docblock);
+            $annotations = static::parseAnnotations($docblock);
             if (isset($annotations['required'])
                 && !isset($providedProperties[$property->name])
             ) {
@@ -447,13 +464,14 @@ class JsonMapper
      * Try to find out if a property exists in a given class.
      * Checks property first, falls back to setter method.
      *
-     * @param object $rc   Reflection class to check
-     * @param string $name Property name
+     * @param ReflectionClass $rc   Reflection class to check
+     * @param string          $name Property name
      *
      * @return array First value: if the property exists
      *               Second value: the accessor to use (
      *                 ReflectionMethod or ReflectionProperty, or null)
      *               Third value: type of the property
+     *               Fourth value: if the property is nullable
      */
     protected function inspectProperty(ReflectionClass $rc, $name)
     {
@@ -463,37 +481,40 @@ class JsonMapper
         if ($rc->hasMethod($setter)) {
             $rmeth = $rc->getMethod($setter);
             if ($rmeth->isPublic() || $this->bIgnoreVisibility) {
+                $isNullable = false;
                 $rparams = $rmeth->getParameters();
                 if (count($rparams) > 0) {
-                    $pclass = $rparams[0]->getClass();
-                    $nullability = '';
-                    if ($rparams[0]->allowsNull()) {
-                        $nullability = '|null';
-                    }
-                    if ($pclass !== null) {
-                        return array(
-                            true, $rmeth,
-                            '\\' . $pclass->getName() . $nullability
-                        );
+                    $isNullable = $rparams[0]->allowsNull();
+                    $ptype      = $rparams[0]->getType();
+                    if ($ptype !== null) {
+                        if ($ptype instanceof ReflectionNamedType) {
+                            $typeName = $ptype->getName();
+                        }
+                        if ($ptype instanceof ReflectionUnionType
+                            || !$ptype->isBuiltin()
+                        ) {
+                            $typeName = '\\' . $typeName;
+                        }
+                        //allow overriding an "array" type hint
+                        // with a more specific class in the docblock
+                        if ($typeName !== 'array') {
+                            return array(
+                                true, $rmeth,
+                                $typeName,
+                                $isNullable,
+                            );
+                        }
                     }
                 }
 
                 $docblock    = $rmeth->getDocComment();
-                $annotations = $this->parseAnnotations($docblock);
+                $annotations = static::parseAnnotations($docblock);
 
                 if (!isset($annotations['param'][0])) {
-                    // If there is no annotations (higher priority) inspect
-                    // if there's a scalar type being defined
-                    if (PHP_MAJOR_VERSION >= 7) {
-                        $ptype = $rparams[0]->getType();
-                        if ($ptype !== null) {
-                            return array(true, $rmeth, $ptype . $nullability);
-                        }
-                    }
-                    return array(true, $rmeth, null);
+                    return array(true, $rmeth, null, $isNullable);
                 }
                 list($type) = explode(' ', trim($annotations['param'][0]));
-                return array(true, $rmeth, $type);
+                return array(true, $rmeth, $type, $this->isNullable($type));
             }
         }
 
@@ -519,24 +540,47 @@ class JsonMapper
         if ($rprop !== null) {
             if ($rprop->isPublic() || $this->bIgnoreVisibility) {
                 $docblock    = $rprop->getDocComment();
-                $annotations = $this->parseAnnotations($docblock);
+                $annotations = static::parseAnnotations($docblock);
 
                 if (!isset($annotations['var'][0])) {
-                    return array(true, $rprop, null);
+                    // If there is no annotations (higher priority) inspect
+                    // if there's a scalar type being defined
+                    if (PHP_VERSION_ID >= 70400 && $rprop->hasType()) {
+                        $rPropType = $rprop->getType();
+                        $propTypeName = $rPropType->getName();
+
+                        if ($this->isSimpleType($propTypeName)) {
+                            return array(
+                              true,
+                              $rprop,
+                              $propTypeName,
+                              $rPropType->allowsNull()
+                            );
+                        }
+
+                        return array(
+                          true,
+                          $rprop,
+                          '\\'.$propTypeName,
+                          $rPropType->allowsNull()
+                        );
+                    }
+
+                    return array(true, $rprop, null, false);
                 }
 
                 //support "@var type description"
                 list($type) = explode(' ', $annotations['var'][0]);
 
-                return array(true, $rprop, $type);
+                return array(true, $rprop, $type, $this->isNullable($type));
             } else {
                 //no setter, private property
-                return array(true, null, null);
+                return array(true, null, null, false);
             }
         }
 
         //no setter, no property
-        return array(false, null, null);
+        return array(false, null, null, false);
     }
 
     /**
@@ -609,7 +653,7 @@ class JsonMapper
      *
      * @return object Freshly created object
      */
-    public function createInstance(
+    protected function createInstance(
         $class, $useParameter = false, $jvalue = null
     ) {
 
@@ -794,7 +838,9 @@ class JsonMapper
      *
      * @param string $docblock Full method docblock
      *
-     * @return array
+     * @return array Array of arrays.
+     *               Key is the "@"-name like "param",
+     *               each value is an array of the rest of the @-lines
      */
     protected static function parseAnnotations($docblock)
     {

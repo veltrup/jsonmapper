@@ -3,6 +3,7 @@
 /dist/
 /vendor/
 /composer.lock
+.phpunit.result.cache
 .buildpath
 .idea
 .project
